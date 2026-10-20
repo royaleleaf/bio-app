@@ -1,3 +1,7 @@
+// This machine's IPv6 route to generativelanguage.googleapis.com stalls;
+// force IPv4 so Gemini calls don't hang indefinitely.
+require('dns').setDefaultResultOrder('ipv4first');
+
 require('dotenv').config();
 
 const express = require('express');
@@ -250,10 +254,10 @@ app.post('/api/chat/:patientId', async (req, res) => {
         botText = await llm.callGemini(llm.buildSystemPrompt(patient, latestCheckin), history);
       } catch (e) {
         console.error('LLM call failed:', e.message);
-        botText = llm.fallbackReply(text);
+        botText = llm.fallbackReply(text, patient, store.listCareItems(patient.id));
       }
     } else {
-      botText = llm.fallbackReply(text);
+      botText = llm.fallbackReply(text, patient, store.listCareItems(patient.id));
     }
 
     // Detect the escalation marker and convert it into a nurse ticket
@@ -280,7 +284,7 @@ app.post('/api/chat/:patientId', async (req, res) => {
       escalated = true;
     }
     // Symptom safety-net: escalate urgent words when no AI is available to judge
-    if (!escalated && !llm.hasKey() && /chest pain|trouble breathing|can'?t breathe|bleeding|fever|diz?zy|vomit|emergency|unbearable|pain [7-9]|pain 10/i.test(text)) {
+    if (!escalated && !llm.hasKey() && llm.needsNurse(text)) {
       ticket = store.createTicket({
         patientId: patient.id,
         reason: 'Urgent symptom reported in chat (auto-detected)',

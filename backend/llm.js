@@ -1,7 +1,7 @@
 // Gemini LLM integration with graceful fallback if no key is present.
 // Uses the REST endpoint directly — no SDK needed.
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 function hasKey() {
   return Boolean(process.env.GEMINI_API_KEY);
@@ -47,6 +47,7 @@ async function callGemini(systemPrompt, history) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20000), // this network stalls sometimes; never hang the chat
   });
 
   if (!res.ok) {
@@ -63,13 +64,111 @@ async function callGemini(systemPrompt, history) {
   return text;
 }
 
-function fallbackReply(text) {
-  const t = text.toLowerCase();
-  const needsNurse =
-    /nurse|help|pain|bleed|breath|dizzy|fever|nause|emergency|doctor/.test(t);
-  return needsNurse
-    ? "I'm a demo assistant running without an AI key right now. A nurse has been notified of your message."
-    : "I'm a demo assistant running without an AI key right now. Ask a visitor-facing question like \"What are the visiting hours?\" or add a GEMINI_API_KEY to backend/.env to enable the real assistant.";
+// Keyword safety-net shared with server.js: anything matched here is escalated
+// into a nurse ticket, and the fallback reply below tells the family so.
+function needsNurse(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\b(nurse|doctor)\b/.test(t)) return true;
+  if (
+    /chest pain|trouble breathing|can'?t breathe|short of breath|bleeding|blood|fever|dizz|vomit|emergency|unbearable|collaps|faint|numb|confus|swelling|swollen/.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  const score = t.match(/\b(\d{1,2})\s*(?:\/|out of)\s*10\b/) || t.match(/pain\D{0,10}?(\d{1,2})/);
+  return Boolean(score && Number(score[1]) >= 7);
 }
 
-module.exports = { hasKey, buildSystemPrompt, callGemini, fallbackReply, GEMINI_MODEL };
+function timeNow() {
+  return new Date().toTimeString().slice(0, 5);
+}
+
+// Offline mode (no GEMINI_API_KEY): answer routine questions from the patient's
+// own record and care-plan timeline instead of nagging about the missing key.
+function fallbackReply(text, patient = {}, careItems = []) {
+  const t = String(text || '').toLowerCase();
+  const has = (re) => re.test(t);
+  const name = patient.name || 'the patient';
+  const room = patient.room ? `room ${patient.room}` : 'the ward';
+  const today = new Date().toISOString().slice(0, 10);
+  const now = timeNow();
+  const pending = (careItems || [])
+    .filter((i) => i.time >= now && !(i.doneDates || []).includes(today))
+    .sort((a, b) => a.time.localeCompare(b.time));
+  const listOf = (items, n = 3) =>
+    items
+      .slice(0, n)
+      .map((i) => `${i.time} – ${i.title}`)
+      .join('; ');
+
+  const urgent = needsNurse(t);
+  if (urgent) {
+    return "That needs a nurse's attention, so I've flagged it on the nurse dashboard — they'll reply here as soon as they can. Please press the call-nurse button too if it's urgent.";
+  }
+
+  if (has(/\b(hi|hello|hey|good (morning|afternoon|evening))\b|who are you|your name|^help$/)) {
+    return `Hi! I'm Willow, the care assistant for ${name} in ${room}. I can tell you about visiting hours, ${patient.room ? 'the room, ' : ''}meals, medication and physio times, allergies, or today's schedule. What would you like to know?`;
+  }
+
+  if (has(/visit|visitor|family|guest|hours|come and see|see (him|her|them)/)) {
+    return `Visiting for ${name}: ${patient.visitorPolicy || 'please check with the ward staff'}.`;
+  }
+
+  if (has(/\broom\b|where (is|are)|location|which floor|ward/)) {
+    return `${name} is in ${room} (patient number ${patient.mrn || 'on file'}).`;
+  }
+
+  if (has(/medic|medicine|meds?|pills?|tablet|drug|dose|morphine|paracetamol|aspirin|ibuprofen|antibiotic/)) {
+    const meds = pending.filter((i) => i.type === 'medication');
+    const line = meds.length
+      ? `Next up today: ${listOf(meds)}.`
+      : "There's nothing further on today's medication timeline.";
+    const allergy = patient.allergies ? ` Known allergies: ${patient.allergies}.` : '';
+    return `${line}${allergy} I can't change doses or give advice that differs from the care plan — please ask the nurse if you're unsure.`;
+  }
+
+  if (has(/physio|physiotherap|therap|exercise|rehab|knee|walk|mobil/)) {
+    const physio = pending.filter((i) => i.type === 'physio');
+    const when = physio.length ? ` Today's sessions: ${listOf(physio)}.` : '';
+    return `Physiotherapy plan: ${patient.physio || 'as scheduled by the care team'}.${when}`;
+  }
+
+  if (has(/meal|food|eat|breakfast|lunch|dinner|diet|drink|fluid|menu|snack|hungry/)) {
+    const meals = pending.filter((i) => i.type === 'meal');
+    const when = meals.length ? ` Coming up: ${listOf(meals)}.` : '';
+    return `Diet plan: ${patient.diet || 'as set by the care team'}.${when}`;
+  }
+
+  if (has(/schedul|timeline|plan|what'?s next|what time|agenda|today|appointment|happening/)) {
+    if (pending.length) {
+      return `Still to come today for ${name}: ${listOf(pending, 5)}. You can see the full day on the schedule tab.`;
+    }
+    return `Today's scheduled care for ${name} is done — nothing else is on the timeline. The care team may still drop by.`;
+  }
+
+  if (has(/allerg/)) {
+    return `Allergies on file for ${name}: ${patient.allergies || 'none known'}.`;
+  }
+
+  if (has(/diagnos|condition|what'?s wrong|why (is|are)|surgery|operation|illness/)) {
+    return `${name}'s current condition: ${patient.diagnosis || 'ask the care team for details'}.`;
+  }
+
+  if (has(/pain|hurt|sore|ache|discomfort/)) {
+    const last = (patient.checkins || [])[patient.checkins.length - 1];
+    const ref = last ? ` Your last check-in reported pain ${last.pain}/10.` : '';
+    return `I'm sorry it's uncomfortable.${ref} If pain is 7/10 or higher, or suddenly much worse, say so and I'll flag the nurse right away — otherwise they can also offer your scheduled pain relief.`;
+  }
+
+  if (has(/check.?in|how (are|is) (you|he|she|they)|feeling|sleep|appetite|mood/)) {
+    const last = (patient.checkins || [])[patient.checkins.length - 1];
+    return last
+      ? `Latest check-in: pain ${last.pain}/10, sleep "${last.sleep}", appetite "${last.appetite}", mood "${last.mood}".`
+      : `There's no check-in recorded yet today — the check-in tab takes about 20 seconds and helps the care team.`;
+  }
+
+  return `I'm running in offline demo mode (no AI key), but I can still help with: visiting hours, ${patient.room ? 'room number, ' : ''}medication and physio times, meals and diet, allergies, the day's schedule, or the latest check-in. Tap a quick-reply chip or ask one of those.`;
+}
+
+module.exports = { hasKey, buildSystemPrompt, callGemini, fallbackReply, needsNurse, GEMINI_MODEL };
